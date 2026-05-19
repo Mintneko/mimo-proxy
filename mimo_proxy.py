@@ -5,6 +5,7 @@ v1.3: 当缓存未命中时，剥离 assistant 消息的 tool_calls（降级为�
      避免 400 错误。MiMo 只对有 tool_calls 的 assistant 消息要求 reasoning_content。
 v1.4: 修复非流式模式下上游返回错误时的处理：检查状态码、添加重试逻辑、
      确保不会返回空 content。
+v1.5
 """
 
 import hashlib
@@ -44,17 +45,16 @@ def _get_client() -> httpx.AsyncClient:
         )
     return _http_client
 
-
 def _msg_hash(msg: dict) -> str:
     content = msg.get("content") or ""
     tool_calls = json.dumps(msg.get("tool_calls") or [], sort_keys=True, ensure_ascii=False)
     raw = f"{content}||{tool_calls}"
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
-
+    h = hashlib.sha256(raw.encode()).hexdigest()[:16]
+    log.info("🔍 _msg_hash: %s", h)
+    return h
 
 def _extract_tool_call_ids(msg: dict) -> list[str]:
-    return [tc.get("id", "") for tc in msg.get("tool_calls") or [] if tc.get("id")]
-
+    return [tc["id"].replace("_", "") for tc in msg.get("tool_calls", []) if tc.get("id")]
 
 def _cache_get(key: str) -> str | None:
     if key in _cache:
@@ -77,11 +77,17 @@ def _cache_set(key: str, value: str):
 def _cache_set_with_index(key: str, value: str, tool_call_ids: list[str]):
     _cache_set(key, value)
     for tid in tool_call_ids:
-        _tool_call_index[tid] = value
+        if tid:
+           _tool_call_index[tid.replace("_", "")] = value
+    log.info("🔍 _tool_call_index keys after set: %s", list(_tool_call_index.keys()))
+    log.info("🔍 _tool_call_index after set: %d entries, keys: %s", 
+         len(_tool_call_index), list(_tool_call_index.keys())[:10])
 
 
 def _find_by_tool_call_ids(msg: dict) -> str | None:
-    for tid in _extract_tool_call_ids(msg):
+    tc_ids = _extract_tool_call_ids(msg)  # 这里拿到的已经去掉下划线了
+    log.info("🔍 _find_by_tool_call_ids: looking for %s", tc_ids)
+    for tid in tc_ids:
         if tid in _tool_call_index:
             return _tool_call_index[tid]
     return None
@@ -133,7 +139,10 @@ def inject_reasoning(messages: list[dict]) -> tuple[int, int]:
                 tc_summary.append(f"[Called {fn.get('name', '?')}]")
 
             if tc_summary:
-                msg["content"] = original_content + " " + " ".join(tc_summary)
+                  if isinstance(original_content, list):
+                   msg["content"] = original_content
+                  else:
+                   msg["content"] = original_content + " " + " ".join(tc_summary)
 
             # 移除 tool_calls（这样 MiMo 就不会要求 reasoning_content）
             del msg["tool_calls"]
@@ -195,6 +204,8 @@ async def _stream_proxy(client: httpx.AsyncClient, url: str, headers: dict, body
 
                             if payload == "[DONE]":
                                 if acc_reasoning and (acc_content or acc_tool_calls):
+                                    # highlight-next-line
+                                    log.info("🔍 synthetic tool_calls raw: %s", json.dumps(acc_tool_calls, ensure_ascii=False)[:300])
                                     synthetic = {
                                         "role": "assistant",
                                         "content": acc_content,
@@ -205,6 +216,7 @@ async def _stream_proxy(client: httpx.AsyncClient, url: str, headers: dict, body
                                     tc_ids = _extract_tool_call_ids(synthetic)
                                     _cache_set_with_index(h, acc_reasoning, tc_ids)
                                     log.info("📦 Cached streaming reasoning [%s] (%d chars)", h[:8], len(acc_reasoning))
+                                    log.info("🔧 Stream cache done, index size=%d", len(_tool_call_index))
                                 yield _sse("[DONE]")
                                 continue
 
@@ -267,10 +279,11 @@ async def chat_completions(request: Request):
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
     messages = body.get("messages", [])
+    assistant_with_tc = sum(1 for m in messages if m.get("role") == "assistant" and m.get("tool_calls"))
+    log.info("🔧 inject_reasoning start: messages=%d, assistant_with_tool_calls=%d, index_size=%d", 
+         len(messages), assistant_with_tc, len(_tool_call_index))
     injected, degraded = inject_reasoning(messages)
-    if injected or degraded:
-        log.info("🔧 Injected=%d, Degraded=%d", injected, degraded)
-
+    log.info("🔧 inject_reasoning done: Injected=%d, Degraded=%d", injected, degraded)
     headers = {}
     auth = request.headers.get("authorization")
     if auth:
@@ -367,7 +380,7 @@ async def list_models(request: Request):
 async def root(request: Request):
     return JSONResponse({
         "status": "running",
-        "service": "MiMo Reasoning Content Proxy v1.3",
+        "service": "MiMo Reasoning Content Proxy v1.4",
         "cache_size": len(_cache),
         "tool_call_index_size": len(_tool_call_index),
         "upstream": MIMO_API_BASE,
@@ -401,6 +414,10 @@ app = Starlette(routes=routes, lifespan=lifespan)
 
 if __name__ == "__main__":
     import uvicorn
+    import io, sys
+    # Force UTF-8 output on Windows
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
     log.info("🚀 MiMo Proxy v1.4 on %s:%d → %s", LISTEN_HOST, LISTEN_PORT, MIMO_API_BASE)
     
