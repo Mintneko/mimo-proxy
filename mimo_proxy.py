@@ -1,12 +1,16 @@
 """
-MiMo Reasoning Content Proxy v1.4
+MiMo Reasoning Content Proxy v1.6
 ==================================
 v1.3: 当缓存未命中时，剥离 assistant 消息的 tool_calls（降级为纯文本），
      避免 400 错误。MiMo 只对有 tool_calls 的 assistant 消息要求 reasoning_content。
 v1.4: 修复非流式模式下上游返回错误时的处理：检查状态码、添加重试逻辑、
      确保不会返回空 content。
+v1.5: 修复工具链断裂问题：缓存未命中时不再剥离 tool_calls（会导致后续 tool 消息
+     成为孤儿），改为注入占位 reasoning_content 保持工具链完整。
+v1.6: 缓存预热 + 索引增强 + 429限流重试 + 并发控制。
 """
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -24,14 +28,15 @@ from starlette.routing import Route
 MIMO_API_BASE = "https://token-plan-cn.xiaomimimo.com/v1"
 LISTEN_HOST = "0.0.0.0"
 LISTEN_PORT = 8899
-CACHE_MAX_SIZE = 2000
-CACHE_TTL = 7200
+CACHE_MAX_SIZE = 5000
+CACHE_TTL = 43200  # 12小时，子代理长时间使用也不易过期
 
 log = logging.getLogger("mimo-proxy")
 
 # ─── 缓存 ──────────────────────────────────────────────────────
 _cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
 _tool_call_index: dict[str, str] = {}
+_process_lock = asyncio.Lock()  # 串行处理锁：一次一个请求，最大化缓存复用并避免限流
 _http_client: httpx.AsyncClient | None = None
 
 
@@ -89,14 +94,37 @@ def _find_by_tool_call_ids(msg: dict) -> str | None:
 
 # ─── 核心逻辑 ──────────────────────────────────────────────────
 
+def _warm_cache_from_messages(messages: list[dict]):
+    """
+    预热缓存：遍历 messages，将已包含 reasoning_content 的 assistant 消息
+    写入缓存。这样同一请求中的后续消息（或并发子代理请求）可以通过
+    tool_call_id 共享缓存。
+    """
+    for msg in messages:
+        if msg.get("role") != "assistant":
+            continue
+        rc = msg.get("reasoning_content")
+        if not rc or not msg.get("tool_calls"):
+            continue
+        h = _msg_hash(msg)
+        tc_ids = _extract_tool_call_ids(msg)
+        _cache_set_with_index(h, rc, tc_ids)
+
+
 def inject_reasoning(messages: list[dict]) -> tuple[int, int]:
     """
     处理 assistant 消息：
     1. 有缓存 → 注入 reasoning_content
-    2. 无缓存 → 剥离 tool_calls（降级为纯文本，避免 400）
-    
-    返回 (注入数, 降级数)
+    2. 无缓存 → 注入占位 reasoning_content（保持工具链完整）
+
+    返回 (注入数, 占位数)
     """
+
+    # 第一步：预热缓存
+    # 子代理可能并发请求，提前将已有 reasoning_content 的消息缓存起来，
+    # 供同批次其他消息或其他子代理的请求复用。
+    _warm_cache_from_messages(messages)
+
     injected = 0
     degraded = 0
 
@@ -108,35 +136,32 @@ def inject_reasoning(messages: list[dict]) -> tuple[int, int]:
         if msg.get("reasoning_content"):
             continue
 
-        # 尝试查找缓存
         h = _msg_hash(msg)
         cached = _cache_get(h)
         if not cached:
             cached = _find_by_tool_call_ids(msg)
+            if cached:
+                # 通过 tool_call_id 命中缓存，也写入主缓存
+                # 后续同 hash 的消息可直接命中主缓存（更快）
+                _cache_set(h, cached)
 
         if cached:
-            # ✅ 有缓存，注入
             msg["reasoning_content"] = cached
             injected += 1
+            # 同步更新 tool_call_index
+            # 这样同请求中后续相同 tool_call_id 的消息，
+            # 或其他并发子代理的消息，也能通过索引找到
+            tc_ids = _extract_tool_call_ids(msg)
+            for tid in tc_ids:
+                _tool_call_index[tid] = cached
             log.info("✅ Injected reasoning_content into msg[%d] [%s] (%d chars)", i, h[:8], len(cached))
         else:
-            # ⚠️ 无缓存，降级：剥离 tool_calls，避免 400
             tc_ids = _extract_tool_call_ids(msg)
-            log.warning("⚠️  No cache for msg[%d] [%s] tool_call_ids=%s → degrading to plain text",
+            log.warning("⚠️  No cache for msg[%d] [%s] tool_call_ids=%s → injecting placeholder reasoning",
                         i, h[:8], tc_ids)
 
-            # 将 tool_calls 信息转为文本摘要附加到 content 中
-            original_content = msg.get("content") or ""
-            tc_summary = []
-            for tc in msg.get("tool_calls") or []:
-                fn = tc.get("function", {})
-                tc_summary.append(f"[Called {fn.get('name', '?')}]")
-
-            if tc_summary:
-                msg["content"] = original_content + " " + " ".join(tc_summary)
-
-            # 移除 tool_calls（这样 MiMo 就不会要求 reasoning_content）
-            del msg["tool_calls"]
+            placeholder = "(reasoning not cached for this message)"
+            msg["reasoning_content"] = placeholder
             degraded += 1
 
     return injected, degraded
@@ -162,7 +187,6 @@ async def _stream_proxy(client: httpx.AsyncClient, url: str, headers: dict, body
     acc_reasoning = ""
     acc_tool_calls: list[dict] = []
 
-    # 流式模式也加重试（针对 5xx）
     last_error = None
     for attempt in range(3):
         try:
@@ -171,12 +195,20 @@ async def _stream_proxy(client: httpx.AsyncClient, url: str, headers: dict, body
                     error_body = await resp.aread()
                     error_text = error_body.decode("utf-8", errors="replace")
                     log.warning("⚠️ Stream upstream %d (attempt %d): %s", resp.status_code, attempt + 1, error_text[:200])
+                    if resp.status_code == 429:
+                        last_error = error_text
+                        if attempt < 2:
+                            wait = 2 ** (attempt + 1)  # 2s, 4s
+                            log.warning("⏳ Rate limited, retrying in %ds (attempt %d/3)", wait, attempt + 1)
+                            await asyncio.sleep(wait)
+                            continue
+                        yield _sse(json.dumps({"error": {"message": f"MiMo API rate limited after retries: {last_error[:200]}", "code": "429"}}))
+                        return
                     if resp.status_code < 500:
                         yield _sse(error_text)
                         return
                     last_error = error_text
                     if attempt < 2:
-                        import asyncio
                         await asyncio.sleep(1 * (attempt + 1))
                         continue
                     yield _sse(json.dumps({"error": {"message": f"MiMo API error after retries: {last_error[:200]}", "code": "502"}}))
@@ -239,14 +271,12 @@ async def _stream_proxy(client: httpx.AsyncClient, url: str, headers: dict, body
                             yield (line + "\n\n").encode("utf-8")
                         else:
                             yield (line + "\n").encode("utf-8")
-                # 流成功完成，退出重试循环
                 return
 
         except httpx.TimeoutException as e:
             log.warning("⚠️ Stream timeout (attempt %d): %s", attempt + 1, e)
             last_error = str(e)
             if attempt < 2:
-                import asyncio
                 await asyncio.sleep(2 * (attempt + 1))
                 continue
         except Exception as e:
@@ -254,7 +284,6 @@ async def _stream_proxy(client: httpx.AsyncClient, url: str, headers: dict, body
             yield _sse(json.dumps({"error": f"Proxy error: {e}"}))
             return
 
-    # 所有重试都失败
     yield _sse(json.dumps({"error": {"message": f"Stream error after retries: {last_error}", "code": "502"}}))
 
 
@@ -266,11 +295,6 @@ async def chat_completions(request: Request):
     except Exception:
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
-    messages = body.get("messages", [])
-    injected, degraded = inject_reasoning(messages)
-    if injected or degraded:
-        log.info("🔧 Injected=%d, Degraded=%d", injected, degraded)
-
     headers = {}
     auth = request.headers.get("authorization")
     if auth:
@@ -281,13 +305,31 @@ async def chat_completions(request: Request):
     client = _get_client()
 
     if is_stream:
+        # 流式响应：在异步生成器内部持有锁，串行处理
+        # 这样可以确保上一个请求刚完成的缓存立刻被下一个请求利用
+        # 同时避免并发请求触发上游限流
+        async def locked_stream():
+            async with _process_lock:
+                messages = body.get("messages", [])
+                injected, degraded = inject_reasoning(messages)
+                if injected or degraded:
+                    log.info("🔧 Injected=%d, Placeholder=%d", injected, degraded)
+                async for chunk in _stream_proxy(client, upstream, headers, body):
+                    yield chunk
+
         return StreamingResponse(
-            _stream_proxy(client, upstream, headers, body),
+            locked_stream(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "Connection": "keep-alive"},
         )
-    else:
-        # 非流式：重试逻辑处理 MiMo 偶发 500
+
+    # 非流式：直接在锁内处理
+    async with _process_lock:
+        messages = body.get("messages", [])
+        injected, degraded = inject_reasoning(messages)
+        if injected or degraded:
+            log.info("🔧 Injected=%d, Placeholder=%d", injected, degraded)
+
         last_error = None
         for attempt in range(3):
             try:
@@ -295,7 +337,17 @@ async def chat_completions(request: Request):
                 if resp.status_code != 200:
                     error_text = resp.text
                     log.warning("⚠️ Upstream %d (attempt %d): %s", resp.status_code, attempt + 1, error_text[:200])
-                    # 4xx 错误不重试（参数问题），5xx 重试
+                    if resp.status_code == 429:
+                        last_error = error_text
+                        if attempt < 2:
+                            wait = 2 ** (attempt + 1)
+                            log.warning("⏳ Rate limited, retrying in %ds (attempt %d/3)", wait, attempt + 1)
+                            await asyncio.sleep(wait)
+                            continue
+                        return JSONResponse(
+                            {"error": {"message": f"MiMo API rate limited after retries: {last_error[:200]}", "code": "429"}},
+                            status_code=429,
+                        )
                     if resp.status_code < 500:
                         return JSONResponse(
                             {"error": {"message": f"Upstream error: {error_text[:200]}", "code": str(resp.status_code)}},
@@ -303,10 +355,8 @@ async def chat_completions(request: Request):
                         )
                     last_error = error_text
                     if attempt < 2:
-                        import asyncio
                         await asyncio.sleep(1 * (attempt + 1))
                         continue
-                    # 最后一次仍然失败
                     return JSONResponse(
                         {"error": {"message": f"MiMo API error after 3 attempts: {last_error[:200]}", "code": "502"}},
                         status_code=502,
@@ -314,7 +364,6 @@ async def chat_completions(request: Request):
 
                 data = resp.json()
 
-                # 检查返回数据是否有效
                 choices = data.get("choices", [])
                 if not choices:
                     log.warning("⚠️ Empty choices in response")
@@ -323,7 +372,6 @@ async def chat_completions(request: Request):
                         status_code=502,
                     )
 
-                # 检查 content 是否为空（MiMo 有时只返回 reasoning_content）
                 msg = choices[0].get("message", {})
                 if not msg.get("content") and not msg.get("tool_calls") and msg.get("reasoning_content"):
                     log.warning("⚠️ Response has reasoning_content but no content, setting fallback")
@@ -338,7 +386,6 @@ async def chat_completions(request: Request):
                 log.warning("⚠️ Timeout (attempt %d): %s", attempt + 1, e)
                 last_error = str(e)
                 if attempt < 2:
-                    import asyncio
                     await asyncio.sleep(2 * (attempt + 1))
                     continue
             except Exception as e:
@@ -367,7 +414,7 @@ async def list_models(request: Request):
 async def root(request: Request):
     return JSONResponse({
         "status": "running",
-        "service": "MiMo Reasoning Content Proxy v1.3",
+        "service": "MiMo Reasoning Content Proxy v1.6",
         "cache_size": len(_cache),
         "tool_call_index_size": len(_tool_call_index),
         "upstream": MIMO_API_BASE,
@@ -402,7 +449,7 @@ app = Starlette(routes=routes, lifespan=lifespan)
 if __name__ == "__main__":
     import uvicorn
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
-    log.info("🚀 MiMo Proxy v1.4 on %s:%d → %s", LISTEN_HOST, LISTEN_PORT, MIMO_API_BASE)
+    log.info("🚀 MiMo Proxy v1.6 on %s:%d → %s", LISTEN_HOST, LISTEN_PORT, MIMO_API_BASE)
     
     # 显示正确的 Trae 配置地址
     import socket
