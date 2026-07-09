@@ -34,7 +34,8 @@ Trae → MiMo Reasoning Proxy → MiMo API
 核心逻辑：
 1. **拦截响应**：从 MiMo 返回的 assistant 消息中提取 `reasoning_content`，按 `content + tool_calls` 哈希缓存
 2. **注入请求**：当 Trae 发送后续请求时，为缺少 `reasoning_content` 的 assistant 消息自动注入缓存值
-3. **降级处理**：如果缓存未命中（如代理启动前的旧对话），自动剥离 `tool_calls` 避免 400
+3. **占位符兜底**：缓存未命中时（例如代理启动前已存在的旧对话），保留原始 `tool_calls` 结构，仅注入占位符 `reasoning_content` 满足 API 字段校验
+4. **历史清洗**：早期版本（v1.3 / v1.4）会把 `tool_calls` 改写成 `[Called X]` 文本注入 `content`，这种污染会被客户端持久化保存，导致模型反复模仿生成假调用。每次请求时主动剥掉 content 末尾的 `[Called ...]` 后缀
 
 ## 快速开始
 

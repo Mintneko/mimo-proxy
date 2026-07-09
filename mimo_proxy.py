@@ -1,11 +1,28 @@
 """
-MiMo Reasoning Content Proxy v1.4
+MiMo Reasoning Content Proxy v1.6
 ==================================
 v1.3: 当缓存未命中时，剥离 assistant 消息的 tool_calls（降级为纯文本），
      避免 400 错误。MiMo 只对有 tool_calls 的 assistant 消息要求 reasoning_content。
 v1.4: 修复非流式模式下上游返回错误时的处理：检查状态码、添加重试逻辑、
      确保不会返回空 content。
+v1.5: 修复 v1.3 降级逻辑导致模型"用文本模仿调用工具"的污染问题。
+     缓存未命中时不再剥离 tool_calls，改为注入占位符 reasoning_content。
+v1.6: 增加历史污染清理：v1.3 在 content 末尾追加的 "[Called X]" 伪工具调用文本
+     会被客户端永久保存到对话历史里，导致模型反复模仿生成假调用。每次请求时
+     主动扫描所有 assistant 消息，从 content 末尾剥掉这种污染标记。
 """
+
+import re
+
+# 缓存未命中时使用的占位符 reasoning_content
+PLACEHOLDER_REASONING = (
+    "(reasoning_content was not preserved by the client; this is a placeholder "
+    "to satisfy the MiMo API contract. Continue based on visible content and tool_calls.)"
+)
+
+# 匹配 v1.3 / v1.4 旧版本在 content 末尾追加的伪工具调用标记
+# 例: " [Called WebFetch]"、" [Called WebFetch] [Called RunCommand]"
+_FAKE_TOOL_CALL_SUFFIX = re.compile(r"(?:\s*\[Called\s+[^\]]+\])+\s*$")
 
 import hashlib
 import json
@@ -89,16 +106,38 @@ def _find_by_tool_call_ids(msg: dict) -> str | None:
 
 # ─── 核心逻辑 ──────────────────────────────────────────────────
 
+def _scrub_fake_tool_call_markers(messages: list[dict]) -> int:
+    """
+    清理历史里 v1.3/v1.4 旧版代理留下的伪工具调用标记。
+    那些版本会在 content 末尾追加 "[Called X]"，客户端会把它持久化进对话历史，
+    模型从历史里学到这种模式后会持续模仿，输出 "让我调用 X [Called X]" 然后停止。
+    每次请求时把这种后缀剥掉，避免污染传递给 MiMo。
+    """
+    scrubbed = 0
+    for i, msg in enumerate(messages):
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content")
+        if not content or not isinstance(content, str):
+            continue
+        cleaned = _FAKE_TOOL_CALL_SUFFIX.sub("", content)
+        if cleaned != content:
+            msg["content"] = cleaned
+            scrubbed += 1
+            log.info("🧹 Scrubbed fake [Called ...] markers from msg[%d]", i)
+    return scrubbed
+
+
 def inject_reasoning(messages: list[dict]) -> tuple[int, int]:
     """
     处理 assistant 消息：
-    1. 有缓存 → 注入 reasoning_content
-    2. 无缓存 → 剥离 tool_calls（降级为纯文本，避免 400）
-    
-    返回 (注入数, 降级数)
+    1. 有缓存 → 注入真实的 reasoning_content
+    2. 无缓存 → 注入占位符 reasoning_content（保留 tool_calls 结构）
+
+    返回 (注入数, 占位符注入数)
     """
     injected = 0
-    degraded = 0
+    placeholder = 0
 
     for i, msg in enumerate(messages):
         if msg.get("role") != "assistant":
@@ -115,31 +154,19 @@ def inject_reasoning(messages: list[dict]) -> tuple[int, int]:
             cached = _find_by_tool_call_ids(msg)
 
         if cached:
-            # ✅ 有缓存，注入
+            # ✅ 有缓存，注入真实内容
             msg["reasoning_content"] = cached
             injected += 1
             log.info("✅ Injected reasoning_content into msg[%d] [%s] (%d chars)", i, h[:8], len(cached))
         else:
-            # ⚠️ 无缓存，降级：剥离 tool_calls，避免 400
+            # ⚠️ 无缓存，注入占位符（保留 tool_calls 结构，避免污染对话）
             tc_ids = _extract_tool_call_ids(msg)
-            log.warning("⚠️  No cache for msg[%d] [%s] tool_call_ids=%s → degrading to plain text",
+            log.warning("⚠️  No cache for msg[%d] [%s] tool_call_ids=%s → injecting placeholder",
                         i, h[:8], tc_ids)
+            msg["reasoning_content"] = PLACEHOLDER_REASONING
+            placeholder += 1
 
-            # 将 tool_calls 信息转为文本摘要附加到 content 中
-            original_content = msg.get("content") or ""
-            tc_summary = []
-            for tc in msg.get("tool_calls") or []:
-                fn = tc.get("function", {})
-                tc_summary.append(f"[Called {fn.get('name', '?')}]")
-
-            if tc_summary:
-                msg["content"] = original_content + " " + " ".join(tc_summary)
-
-            # 移除 tool_calls（这样 MiMo 就不会要求 reasoning_content）
-            del msg["tool_calls"]
-            degraded += 1
-
-    return injected, degraded
+    return injected, placeholder
 
 
 def cache_reasoning_from_message(msg: dict):
@@ -267,9 +294,10 @@ async def chat_completions(request: Request):
         return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
 
     messages = body.get("messages", [])
-    injected, degraded = inject_reasoning(messages)
-    if injected or degraded:
-        log.info("🔧 Injected=%d, Degraded=%d", injected, degraded)
+    scrubbed = _scrub_fake_tool_call_markers(messages)
+    injected, placeholder = inject_reasoning(messages)
+    if injected or placeholder or scrubbed:
+        log.info("🔧 Scrubbed=%d, Injected=%d, Placeholder=%d", scrubbed, injected, placeholder)
 
     headers = {}
     auth = request.headers.get("authorization")
@@ -367,7 +395,7 @@ async def list_models(request: Request):
 async def root(request: Request):
     return JSONResponse({
         "status": "running",
-        "service": "MiMo Reasoning Content Proxy v1.3",
+        "service": "MiMo Reasoning Content Proxy v1.6",
         "cache_size": len(_cache),
         "tool_call_index_size": len(_tool_call_index),
         "upstream": MIMO_API_BASE,
@@ -402,7 +430,7 @@ app = Starlette(routes=routes, lifespan=lifespan)
 if __name__ == "__main__":
     import uvicorn
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s", datefmt="%H:%M:%S")
-    log.info("🚀 MiMo Proxy v1.4 on %s:%d → %s", LISTEN_HOST, LISTEN_PORT, MIMO_API_BASE)
+    log.info("🚀 MiMo Proxy v1.6 on %s:%d → %s", LISTEN_HOST, LISTEN_PORT, MIMO_API_BASE)
     
     # 显示正确的 Trae 配置地址
     import socket
